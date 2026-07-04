@@ -1,0 +1,9 @@
+requests
+pyopencl
+numpy
+
+# Optional, for the watchdog's GPU monitoring (AMD/ROCm).
+# Best installed via your system package manager so it links against ROCm:
+#   Fedora:        sudo dnf install amdsmi
+#   Debian/Ubuntu: sudo apt install amd-smi-lib
+# The watchdog falls back to the `rocm-smi` CLI if amdsmi is not available.

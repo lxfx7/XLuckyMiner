@@ -1,0 +1,18 @@
+*config.py
+
+logs/*
+
+
+wallet*
+
+# Generales de python
+__pycache__
+
+# Editor
+.vscode/
+
+# Backups/artefactos por máquina (p.ej. main-DESKTOP-XXXX.py)
+*-DESKTOP-*.py
+
+# Generales de windows
+Thumbs.db
