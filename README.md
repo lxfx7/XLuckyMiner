@@ -8,6 +8,7 @@ A Python-based solo Bitcoin miner that uses OpenCL for GPU hashing. Designed to 
 - **Load Limiting**: Configurable GPU load limit (default 30%) to allow for background usage.
 - **Auto Start/Pause (Watchdog)**: `watchdog.py` starts the miner when the GPU has been idle for a while and pauses it automatically when another app needs the GPU. GPU usage is read via `amdsmi` (with a `rocm-smi` fallback).
 - **Telegram Notifications**: Get alerts on startup and if you find a block. Messages are network-aware, so test-network blocks are clearly marked as `[TEST]` and never look like a real reward.
+- **Failure Alerts**: You also get a Telegram alert when the miner crashes (with the exit code and the last log lines), when the watchdog itself crashes, and when the miner is running but *not* hashing — for example while the node is still in initial block download and refuses to hand out block templates.
 
 ## Prerequisites
 1. **Bitcoin Node**: You need a fully synced Bitcoin node (e.g., Bitcoin Core) running with RPC enabled.

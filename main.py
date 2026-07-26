@@ -3,6 +3,7 @@ import struct
 import binascii
 import logging
 import os
+import traceback
 import numpy as np
 from miner.network import BitcoindClient
 from miner.hashing import GPUMiner
@@ -31,65 +32,110 @@ logging.basicConfig(
     ]
 )
 
+# How long to wait between retries while the node has no block template for us
+# (typically: still in initial block download).
+TEMPLATE_RETRY_SECONDS = 30
+# Don't repeat the "still waiting" line in the log more often than this.
+WAITING_LOG_INTERVAL_SECONDS = 300
+
+telegram_sender = None
+
+
+def notify(text):
+    """Best-effort Telegram notification; never breaks the mining loop."""
+    if telegram_sender:
+        try:
+            telegram_sender.send_message(text)
+        except Exception as e:
+            logging.error(f"Telegram notification failed: {e}")
+
+
+class MinerFatalError(Exception):
+    """A condition the miner cannot recover from on its own."""
+
+
 def main():
+    global telegram_sender
+
     logging.info(f"XLuckyMiner Starting... Payout Address: {WALLET_ADDRESS}")
-    
+
     # Initialize Telegram Sender
-    telegram_sender = None
     if tg_config and hasattr(tg_config, 'TELEGRAM_BOT_TOKEN'):
         telegram_sender = TelegramSender(tg_config.TELEGRAM_BOT_TOKEN, tg_config.TELEGRAM_CHAT_ID)
         telegram_sender.send_message(f"🚀 XLuckyMiner Started!\nAddress: `{WALLET_ADDRESS}`")
 
     client = BitcoindClient()
-    
+
     # Check connection
     info = client.get_blockchain_info()
     if not info:
-        logging.error("Failed to connect to Bitcoin Node. Check config.py and ensure node is running.")
-        return
+        raise MinerFatalError(
+            f"Failed to connect to the Bitcoin node ({client.last_error}). "
+            f"Check config.py and ensure bitcoind is running."
+        )
     chain = info.get('chain', 'unknown')
     is_mainnet = (chain == 'main')
     logging.info(f"Connected to Bitcoin Node. Chain: {chain}, Blocks: {info.get('blocks')}")
     if not is_mainnet:
         logging.warning(f"Running on '{chain}' — this is a TEST network, coins are NOT real BTC.")
 
+    # A node still in initial block download refuses getblocktemplate, so the
+    # miner would sit at 0% GPU forever. Say so up front instead.
+    if info.get('initialblockdownload'):
+        progress = float(info.get('verificationprogress', 0)) * 100
+        sync_msg = (
+            f"Node is still syncing ({info.get('blocks')}/{info.get('headers')} blocks, "
+            f"{progress:.2f}%). Mining cannot start until the sync finishes."
+        )
+        logging.warning(sync_msg)
+        notify(f"⏳ XLuckyMiner is waiting: {sync_msg}")
+
     # Validate Address and get ScriptPubKey
     addr_info = client.validate_address(WALLET_ADDRESS)
     if not addr_info or not addr_info.get('isvalid'):
-        logging.error(f"Invalid Wallet Address: {WALLET_ADDRESS}")
-        return
-    
+        raise MinerFatalError(f"Invalid Wallet Address: {WALLET_ADDRESS}")
+
     script_pubkey = addr_info.get('scriptPubKey')
     if not script_pubkey:
-        # Some versions return it in 'embedded' or different fields?
-        # Usually it is 'scriptPubKey' (hex string) or 'scriptPubKey' (object with hex)?
-        # validateaddress details: 'scriptPubKey' is hex string.
-        logging.error(f"Could not get scriptPubKey for {WALLET_ADDRESS}")
-        if 'scriptPubKey' in addr_info: 
-             # Check if it's nested dictionary? No, usually hex string.
-             pass
-        # Fallback to outputting info to debug
+        # validateaddress details: 'scriptPubKey' is a hex string.
         logging.error(f"Addr Info: {addr_info}")
-        return
-        
+        raise MinerFatalError(f"Could not get scriptPubKey for {WALLET_ADDRESS}")
+
     logging.info(f"ScriptPubKey: {script_pubkey}")
-    
+
     try:
         miner = GPUMiner()
         logging.info(f"GPU Initialized: {miner.device.name}")
     except Exception as e:
-        logging.error(f"Failed to initialize GPU Miner: {e}")
-        return
+        raise MinerFatalError(f"Failed to initialize GPU Miner: {e}") from e
 
     logging.info("Starting Mining Loop...")
+    waiting_for_template = False   # are we currently unable to mine?
+    last_waiting_log = 0.0
     while True:
         # 1. Get Block Template
         template = client.get_block_template()
         if not template:
-            print("Failed to get block template. Retrying in 5s...")
-            time.sleep(5)
+            # No template = no mining. Report it (once per state change) instead
+            # of spinning silently at 0% GPU.
+            reason = client.last_error or "no response from the node"
+            now = time.time()
+            if not waiting_for_template:
+                waiting_for_template = True
+                last_waiting_log = now
+                logging.warning(f"No block template, GPU is idle: {reason}")
+                notify(f"⚠️ XLuckyMiner is NOT mining — no block template.\nReason: {reason}")
+            elif now - last_waiting_log >= WAITING_LOG_INTERVAL_SECONDS:
+                last_waiting_log = now
+                logging.warning(f"Still no block template: {reason}")
+            time.sleep(TEMPLATE_RETRY_SECONDS)
             continue
-        
+
+        if waiting_for_template:
+            waiting_for_template = False
+            logging.info("Block template available again — resuming mining.")
+            notify("✅ XLuckyMiner resumed — the node is serving block templates again.")
+
         # 2. Parse Template
         version = template['version']
         prev_hash = template['previousblockhash'] # Big Endian Hex
@@ -231,18 +277,20 @@ def main():
                     print(f"Submitting Block... (Size: {len(block_hex)//2} bytes)")
                     submission_result = client.submit_block(block_hex)
                     
-                    if submission_result is None: # Standard success is None or 'null'
+                    # Standard success is a null result AND no RPC error — an RPC
+                    # failure also yields None and must not read as "accepted".
+                    if submission_result is None and not client.last_error:
                        if is_mainnet:
                            msg = f"🎉 BLOCK ACCEPTED! Real reward! Nonce: {found_nonce}"
                        else:
                            msg = f"🧪 [TEST · {chain}] Block accepted on a TEST network — NOT real BTC. Nonce: {found_nonce}"
                        logging.info(f"BLOCK ACCEPTED! (chain={chain})")
                     else:
-                       msg = f"⚠️ Block found but submission result: {submission_result} (chain={chain})"
-                       logging.error(f"Submission Error: {submission_result}")
+                       detail = submission_result if submission_result is not None else client.last_error
+                       msg = f"⚠️ Block found but submission result: {detail} (chain={chain})"
+                       logging.error(f"Submission Error: {detail}")
 
-                    if telegram_sender:
-                        telegram_sender.send_message(msg + f"\nHeader: `{bytes_to_hex(full_header)}`")
+                    notify(msg + f"\nHeader: `{bytes_to_hex(full_header)}`")
 
                 else:
                     # Valid Share (POW OK, but difficulty too low for network)
@@ -263,4 +311,18 @@ def main():
         print("\nRefreshing Block Template...")
 
 if __name__ == "__main__":
-    main()
+    # Any way the miner stops other than Ctrl+C is a failure the operator has to
+    # hear about — otherwise the process just disappears and the GPU goes quiet.
+    try:
+        main()
+    except KeyboardInterrupt:
+        logging.info("Miner stopped by user (Ctrl+C).")
+        sys.exit(0)
+    except MinerFatalError as e:
+        logging.error(f"Fatal: {e}")
+        notify(f"💥 XLuckyMiner stopped\n{e}")
+        sys.exit(1)
+    except Exception as e:
+        logging.exception("Miner crashed with an unhandled exception")
+        notify(f"💥 XLuckyMiner CRASHED\n{type(e).__name__}: {e}\n\n{traceback.format_exc()[-1200:]}")
+        sys.exit(1)

@@ -3,6 +3,10 @@ import json
 import logging
 
 
+# Telegram rejects anything longer than 4096 characters.
+MAX_MESSAGE_LENGTH = 4000
+
+
 class TelegramSender:
     def __init__(self, token, chat_id):
         self.token = token
@@ -12,18 +16,23 @@ class TelegramSender:
         if not self.enabled:
             print("Telegram notification disabled (missing config).")
 
-    def send_message(self, text):
+    def send_message(self, text, parse_mode="Markdown"):
         """Sends a message to the configured Telegram chat."""
         if not self.enabled:
             return False
 
+        if len(text) > MAX_MESSAGE_LENGTH:
+            text = text[:MAX_MESSAGE_LENGTH] + "\n[...truncated]"
+
         try:
-            payload = {
-                "chat_id": self.chat_id,
-                "text": text,
-                "parse_mode": "Markdown"
-            }
+            payload = {"chat_id": self.chat_id, "text": text}
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
             response = requests.post(self.base_url, json=payload, timeout=10)
+            if response.status_code == 400 and parse_mode:
+                # Crash alerts carry tracebacks, whose stray _ * ` characters are
+                # invalid Markdown. Resend as plain text so the alert still lands.
+                return self.send_message(text, parse_mode=None)
             if response.status_code != 200:
                 print(f"Failed to send Telegram message: {response.text}")
                 return False

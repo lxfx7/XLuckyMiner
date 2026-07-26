@@ -21,7 +21,10 @@ import os
 import sys
 import json
 import shutil
+import signal
 import logging
+import traceback
+from collections import deque
 
 # ==========================================
 # CONFIGURATION
@@ -51,6 +54,13 @@ CHECK_INTERVAL_SECONDS  = getattr(config, "CHECK_INTERVAL_SECONDS", 5)
 GPU_INDEX               = getattr(config, "GPU_INDEX", 0)
 
 MINER_SCRIPT = "main.py"
+MINER_LOG = os.path.join("logs", "xluckyminer.log")
+
+# A miner that dies sooner than this after starting is treated as crash-looping;
+# the restart delay then grows so a broken setup doesn't spam Telegram.
+FAST_EXIT_SECONDS = 120
+CRASH_BACKOFF_BASE_SECONDS = 60
+CRASH_BACKOFF_MAX_SECONDS = 1800
 # ==========================================
 
 # Optional Telegram notifications
@@ -131,10 +141,28 @@ def get_gpu_usage(backend, samples=4, gap=0.25):
     return sum(values) / len(values) if values else 0.0
 
 
+def notify(telegram, text):
+    """Best-effort Telegram notification; never breaks the watchdog loop."""
+    if not telegram:
+        return
+    try:
+        telegram.send_message(text)
+    except Exception as e:
+        logging.error(f"Telegram notification failed: {e}")
+
+
+def miner_log_tail(lines=12):
+    """Last lines of the miner log, to explain a crash in the alert itself."""
+    try:
+        with open(MINER_LOG, "r", encoding="utf-8", errors="replace") as f:
+            return "".join(deque(f, maxlen=lines)).strip()
+    except Exception as e:
+        return f"(could not read {MINER_LOG}: {e})"
+
+
 def stop_miner(proc, telegram, reason):
     logging.warning(f"\n{reason}")
-    if telegram:
-        telegram.send_message(reason)
+    notify(telegram, reason)
     proc.terminate()
     try:
         proc.wait(timeout=5)
@@ -157,26 +185,26 @@ def main():
             f"below PAUSE_THRESHOLD_PERCENT ({PAUSE_THRESHOLD_PERCENT}%)."
         )
 
-    backend = init_backend()
-    if backend[0] is None:
-        logging.error(
-            "No GPU usage backend found. Install 'amdsmi' (sudo dnf install amdsmi) "
-            "or ensure 'rocm-smi' is on PATH."
-        )
-        return
-
-    logging.info(
-        f"Watchdog started. Mine@~{GPU_LOAD_LIMIT_PERCENT}% | "
-        f"start when idle<{IDLE_THRESHOLD_PERCENT}% for {IDLE_WAIT_MINUTES}m | "
-        f"pause when total>{PAUSE_THRESHOLD_PERCENT}% sustained {PAUSE_SUSTAIN_SECONDS}s"
-    )
-
     telegram = None
     if TELEGRAM_ENABLED:
         try:
             telegram = TelegramSender(tg_config.TELEGRAM_BOT_TOKEN, tg_config.TELEGRAM_CHAT_ID)
         except Exception as e:
             logging.error(f"Telegram init failed: {e}")
+
+    backend = init_backend()
+    if backend[0] is None:
+        msg = ("No GPU usage backend found. Install 'amdsmi' (sudo dnf install amdsmi) "
+               "or ensure 'rocm-smi' is on PATH.")
+        logging.error(msg)
+        notify(telegram, f"💥 XLuckyMiner watchdog could not start\n{msg}")
+        sys.exit(1)
+
+    logging.info(
+        f"Watchdog started. Mine@~{GPU_LOAD_LIMIT_PERCENT}% | "
+        f"start when idle<{IDLE_THRESHOLD_PERCENT}% for {IDLE_WAIT_MINUTES}m | "
+        f"pause when total>{PAUSE_THRESHOLD_PERCENT}% sustained {PAUSE_SUSTAIN_SECONDS}s"
+    )
 
     # --now / -n skips the initial idle wait.
     force_start = len(sys.argv) > 1 and sys.argv[1] in ("--now", "-n")
@@ -187,7 +215,10 @@ def main():
         last_busy_time = time.time()
 
     miner_process = None
+    miner_started_at = 0.0
     busy_since = None  # when the GPU first crossed the pause threshold (streak start)
+    fast_exits = 0     # consecutive crash-loop exits
+    hold_until = 0.0   # don't start the miner again before this time
 
     try:
         while True:
@@ -198,23 +229,53 @@ def main():
                 if usage >= IDLE_THRESHOLD_PERCENT:
                     last_busy_time = time.time()  # not idle -> restart countdown
                     print(f"Status: BUSY  (GPU: {usage:4.1f}%) | waiting for idle...   ", end='\r')
+                elif time.time() < hold_until:
+                    wait_left = hold_until - time.time()
+                    print(f"Status: HELD  (GPU: {usage:4.1f}%) | crash backoff {wait_left:.0f}s   ", end='\r')
                 else:
                     minutes_idle = (time.time() - last_busy_time) / 60.0
                     print(f"Status: IDLE  (GPU: {usage:4.1f}%) | {minutes_idle:.1f}/{IDLE_WAIT_MINUTES}m   ", end='\r')
                     if minutes_idle >= IDLE_WAIT_MINUTES:
                         msg = f"🟢 GPU idle {minutes_idle:.1f}m. Starting miner."
                         logging.info(f"\n{msg}")
-                        if telegram:
-                            telegram.send_message(msg)
+                        notify(telegram, msg)
                         miner_process = subprocess.Popen([sys.executable, MINER_SCRIPT])
+                        miner_started_at = time.time()
                         logging.info(f"Miner PID: {miner_process.pid}")
                         busy_since = None
             else:
                 # Miner ON.
                 if miner_process.poll() is not None:
-                    logging.warning("\nMiner process died unexpectedly. Resetting timer.")
-                    if telegram:
-                        telegram.send_message("⚠️ Miner process died. Resetting watchdog timer.")
+                    code = miner_process.returncode
+                    ran_for = time.time() - miner_started_at
+
+                    # Back off on a crash loop so a broken node/GPU doesn't
+                    # produce a Telegram alert every few minutes.
+                    if ran_for < FAST_EXIT_SECONDS:
+                        fast_exits += 1
+                        backoff = min(
+                            CRASH_BACKOFF_BASE_SECONDS * (2 ** (fast_exits - 1)),
+                            CRASH_BACKOFF_MAX_SECONDS,
+                        )
+                    else:
+                        fast_exits = 0
+                        backoff = 0
+                    hold_until = time.time() + backoff
+
+                    logging.warning(
+                        f"\nMiner exited (code {code}) after {ran_for:.0f}s. "
+                        f"Retry hold: {backoff}s."
+                    )
+                    retry_note = (
+                        f"Retrying once the GPU is idle (+{backoff}s backoff)."
+                        if backoff else "Retrying once the GPU is idle."
+                    )
+                    notify(
+                        telegram,
+                        f"⚠️ XLuckyMiner stopped — process exited with code {code} "
+                        f"after {ran_for:.0f}s.\n{retry_note}\n\nLast log lines:\n"
+                        f"{miner_log_tail()}"
+                    )
                     miner_process = None
                     last_busy_time = time.time()
                     busy_since = None
@@ -244,8 +305,32 @@ def main():
         logging.info("\nWatchdog shutting down (Ctrl+C).")
         if miner_process:
             miner_process.terminate()
+    except SystemExit:
+        # SIGTERM (logout, shutdown, systemctl stop): expected, not a crash.
+        logging.info("\nWatchdog shutting down (SIGTERM).")
+        notify(telegram, "🛑 XLuckyMiner watchdog stopped (SIGTERM).")
+        if miner_process:
+            miner_process.terminate()
+        raise
+    except Exception as e:
+        # Nothing else supervises the watchdog, so an unhandled exception here
+        # silently ends all mining. Always report it.
+        logging.exception("Watchdog crashed")
+        notify(
+            telegram,
+            f"💥 XLuckyMiner WATCHDOG CRASHED — mining has stopped.\n"
+            f"{type(e).__name__}: {e}\n\n{traceback.format_exc()[-1200:]}"
+        )
+        if miner_process:
+            miner_process.terminate()
+        sys.exit(1)
+
+
+def _on_sigterm(signum, frame):
+    raise SystemExit(0)
 
 
 if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    signal.signal(signal.SIGTERM, _on_sigterm)
     main()
